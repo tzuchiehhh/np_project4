@@ -3,9 +3,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <boost/algorithm/string.hpp>
 #include <boost/asio.hpp>
 #include <boost/filesystem.hpp>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <regex>
@@ -316,6 +318,22 @@ class socks
         return domain_name;
     }
 
+    vector<tuple<string, string, string>> get_firewall_rules(string filename) {
+        // queue<string> commands;
+        vector<tuple<string, string, string>> firewall_rules;
+        string line;
+        ifstream file;
+        file.open(filename);
+        while (getline(file, line)) {
+            stringstream ss(line);
+            string permission, mode, pattern;
+            ss >> permission >> mode >> pattern;
+            firewall_rules.push_back({permission, mode, pattern});
+        }
+        file.close();
+        return firewall_rules;
+    }
+
     void do_connection() {
         string host;
         if (request.DOMAIN_NAME != "") {
@@ -335,19 +353,53 @@ class socks
         message.D_IP = endpoint.address().to_string();
         message.D_PORT = request.DSTPORT;
 
+        // check firewall
+        bool permit = false;
+        // 0: permission; 1: mode; 2: pattern
+        vector<tuple<string, string, string>> firewall_rules = get_firewall_rules("socks.conf");
+        for (unsigned int i = 0; i < firewall_rules.size(); i++) {
+            if (get<0>(firewall_rules[i]) != "permit") {
+                continue;
+            }
+
+            if ((get<1>(firewall_rules[i]) == "c" && request.CD == 1) || (get<1>(firewall_rules[i]) == "b" && request.CD == 2)) {
+                string pattern = get<2>(firewall_rules[i]);
+                boost::replace_all(pattern, ".", "\\.");
+                boost::replace_all(pattern, "*", "\\d+");
+                pattern = "^" + pattern + "$";
+
+                std::regex regex_pattern(pattern);
+                if (std::regex_match(message.S_IP, regex_pattern)) {
+                    permit = true;
+                    break;
+                }
+            }
+        }
         // connect
         if (request.CD == 1) {
             message.Command = "CONNECT";
-            message.Reply = "Accept";
-            show_message();
-            make_shared<Connect>(move(client_socket), move(server_socket), endpoint)->start();
+            if (permit == true) {
+                message.Reply = "Accept";
+                show_message();
+                make_shared<Connect>(move(client_socket), move(server_socket), endpoint)->start();
+            } else {
+                message.Reply = "Reject";
+                show_message();
+                send_reject();
+            }
         }
         // Bind
         else if (request.CD == 2) {
             message.Command = "Bind";
-            message.Reply = "Accept";
-            show_message();
-            make_shared<Bind>(move(client_socket), move(server_socket), io_context)->start();
+            if (permit == true) {
+                message.Reply = "Accept";
+                show_message();
+                make_shared<Bind>(move(client_socket), move(server_socket), io_context)->start();
+            } else {
+                message.Reply = "Reject";
+                show_message();
+                send_reject();
+            }
         }
     }
 
@@ -361,16 +413,15 @@ class socks
         cout << endl;
     }
 
-    // void send_reject() {
-    //     auto self(shared_from_this());
-    //     unsigned char reply[8] = {0, 91, 0, 0, 0, 0, 0, 0};
-    //     memcpy(data_, reply, 8);
-    //     boost::asio::async_write(client_socket, boost::asio::buffer(data_, 8), [this, self](boost::system::error_code ec, size_t /*length*/) {
-    //         if (!ec) {
-    //             client_socket.close();
-    //         }
-    //     });
-    // }
+    void send_reject() {
+        auto self(shared_from_this());
+        unsigned char reply[8] = {0, 91, 0, 0, 0, 0, 0, 0};
+        boost::asio::async_write(client_socket, boost::asio::buffer(reply, 8), [this, self](boost::system::error_code ec, size_t /*length*/) {
+            if (!ec) {
+                client_socket.close();
+            }
+        });
+    }
 };
 
 class server {
