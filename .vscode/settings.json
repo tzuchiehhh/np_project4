@@ -3,6 +3,7 @@
         "regex": "cpp",
         "string": "cpp",
         "iostream": "cpp",
-        "*.ipp": "cpp"
+        "*.ipp": "cpp",
+        "ostream": "cpp"
     }
 }

@@ -25,6 +25,15 @@ struct socks4_request {
     string DOMAIN_NAME;
 };
 
+struct Message {
+    string S_IP;
+    unsigned short S_PORT;
+    string D_IP;
+    string D_PORT;
+    string Command;
+    string Reply;
+};
+
 struct socks4_reply {
     int VN;
     // 90: request granted; 91: request rejected or failed
@@ -33,10 +42,118 @@ struct socks4_reply {
     string DSTIP;
 };
 
-class Connection
-    : public enable_shared_from_this<Connection> {
+class Bind
+    : public enable_shared_from_this<Bind> {
    public:
-    Connection(tcp::socket client_socket, tcp::socket server_socket, tcp::endpoint endpoint)
+    Bind(tcp::socket client_socket, tcp::socket server_socket, boost::asio::io_context &io_context)
+        : client_socket(move(client_socket)), server_socket(move(server_socket)), acceptor(io_context, tcp::endpoint(tcp::v4(), 0)) {
+        memset(client_buffer, 0x00, max_length);
+        memset(server_buffer, 0x00, max_length);
+        dstport = acceptor.local_endpoint().port();
+    }
+
+    void start() {
+        bind_reply(false);
+    }
+
+   private:
+    tcp::socket client_socket;
+    tcp::socket server_socket;
+    tcp::acceptor acceptor;
+    enum { max_length = 10240 };
+    unsigned char client_buffer[max_length];
+    unsigned char server_buffer[max_length];
+    unsigned short dstport;
+
+    void bind_reply(bool bind) {
+        auto self(shared_from_this());
+        unsigned char p1 = dstport / 256;
+        unsigned char p2 = dstport % 256;
+        unsigned char reply[8] = {0, 90, p1, p2, 0, 0, 0, 0};
+        boost::asio::async_write(client_socket, boost::asio::buffer(reply, 8), [this, self, bind](boost::system::error_code ec, size_t) {
+            if (!ec) {
+                if (bind == false) {
+                    do_accept();
+                } else {
+                    read_client();
+                    read_server();
+                }
+            }
+        });
+    }
+
+    void do_accept() {
+        auto self(shared_from_this());
+        acceptor.async_accept(server_socket, [this, self](boost::system::error_code ec) {
+            if (!ec) {
+                bind_reply(true);
+                acceptor.close();
+            }
+        });
+    }
+
+    // get data from client
+    void read_client() {
+        auto self(shared_from_this());
+        client_socket.async_read_some(boost::asio::buffer(client_buffer, max_length), [this, self](boost::system::error_code ec, size_t length) {
+            if (!ec) {
+                write_server(length);
+            } else if (ec == boost::asio::error::eof) {
+                boost::system::error_code ect;
+                client_socket.shutdown(boost::asio::ip::tcp::socket::shutdown_receive, ect);
+                server_socket.shutdown(boost::asio::ip::tcp::socket::shutdown_send, ect);
+            } else {
+                read_client();
+            }
+        });
+    }
+
+    // forward data to server
+    void write_server(size_t length) {
+        auto self(shared_from_this());
+        boost::asio::async_write(server_socket, boost::asio::buffer(client_buffer, length), [this, self](boost::system::error_code ec, size_t length) {
+            if (!ec) {
+                read_client();
+            } else {
+                // client_socket.close();
+            }
+        });
+    }
+
+    // get data from server
+    void read_server() {
+        auto self(shared_from_this());
+        server_socket.async_read_some(boost::asio::buffer(server_buffer, max_length), [this, self](boost::system::error_code ec, size_t length) {
+            if (!ec) {
+                write_client(length);
+            } else if (ec == boost::asio::error::eof) {
+                boost::system::error_code ect;
+
+                server_socket.shutdown(boost::asio::ip::tcp::socket::shutdown_receive, ect);
+                client_socket.shutdown(boost::asio::ip::tcp::socket::shutdown_send, ect);
+            } else {
+                read_server();
+            }
+        });
+    }
+
+    // forward data to client
+    void write_client(size_t length) {
+        auto self(shared_from_this());
+        boost::asio::async_write(client_socket, boost::asio::buffer(server_buffer, length), [this, self](boost::system::error_code ec, size_t length) {
+            if (!ec) {
+                read_server();
+            } else {
+                // client_socket.close();
+            }
+        });
+    }
+};
+
+class Connect
+    : public enable_shared_from_this<Connect> {
+   public:
+    Connect(tcp::socket client_socket, tcp::socket server_socket, tcp::endpoint endpoint)
         : client_socket(move(client_socket)), server_socket(move(server_socket)), endpoint(endpoint) {
         memset(client_buffer, 0x00, max_length);
         memset(server_buffer, 0x00, max_length);
@@ -63,9 +180,8 @@ class Connection
     void connect_reply() {
         auto self(shared_from_this());
         unsigned char reply[8] = {0, 90, 0, 0, 0, 0, 0, 0};
-        memcpy(client_buffer, reply, 8);
         boost::asio::async_write(
-            client_socket, boost::asio::buffer(client_buffer, 8), [this, self](boost::system::error_code ec, size_t) {
+            client_socket, boost::asio::buffer(reply, 8), [this, self](boost::system::error_code ec, size_t) {
                 if (!ec) {
                     read_client();
                     read_server();
@@ -131,7 +247,6 @@ class Connection
     }
 };
 
-
 class socks
     : public enable_shared_from_this<socks> {
    public:
@@ -149,6 +264,7 @@ class socks
     boost::asio::io_context &io_context;
 
     socks4_request request;
+    Message message;
 
     void parse_request() {
         auto self(shared_from_this());
@@ -213,10 +329,36 @@ class socks
         tcp::resolver::query query(host, request.DSTPORT);
         tcp::resolver::iterator iter = resolver.resolve(query);
         tcp::endpoint endpoint = iter->endpoint();
+
+        message.S_IP = client_socket.remote_endpoint().address().to_string();
+        message.S_PORT = client_socket.remote_endpoint().port();
+        message.D_IP = endpoint.address().to_string();
+        message.D_PORT = request.DSTPORT;
+
         // connect
         if (request.CD == 1) {
-            make_shared<Connection>(move(client_socket), move(server_socket), endpoint)->start();
+            message.Command = "CONNECT";
+            message.Reply = "Accept";
+            show_message();
+            make_shared<Connect>(move(client_socket), move(server_socket), endpoint)->start();
         }
+        // Bind
+        else if (request.CD == 2) {
+            message.Command = "Bind";
+            message.Reply = "Accept";
+            show_message();
+            make_shared<Bind>(move(client_socket), move(server_socket), io_context)->start();
+        }
+    }
+
+    void show_message() {
+        cout << "<S_IP>: " << message.S_IP << endl;
+        cout << "<S_PORT>: " << message.S_PORT << endl;
+        cout << "<D_IP>: " << message.D_IP << endl;
+        cout << "<D_PORT>: " << message.D_PORT << endl;
+        cout << "<Command>: " << message.Command << endl;
+        cout << "<Reply>: " << message.Reply << endl;
+        cout << endl;
     }
 
     // void send_reject() {
@@ -230,7 +372,6 @@ class socks
     //     });
     // }
 };
-
 
 class server {
    public:
